@@ -17,7 +17,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Desencapsula os 302/307 intermediários do BestCine para entregar direto o MP4 final
+// Desencapsula os 302/307 intermediários do BestCine para entregar direto o MP4
 function resolveFinalDirectUrl(urlStr, maxRedirects = 6) {
   return new Promise((resolve) => {
     function step(currentUrl, count) {
@@ -64,7 +64,7 @@ app.get("/play/:type/:id/:quality", async (req, res) => {
 
   let candidateUrl = null;
 
-  // 1. Busca streams no BestCine
+  // 1. Tenta pegar os streams do BestCine primeiro (se não estiver bloqueado pelo Cloudflare)
   try {
     const bcRes = await axios.get(`https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`, {
       headers: {
@@ -72,7 +72,7 @@ app.get("/play/:type/:id/:quality", async (req, res) => {
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         Referer: "https://bestcine.dpdns.org/"
       },
-      timeout: 3000
+      timeout: 2500
     });
 
     const bcStreams = bcRes.data?.streams || [];
@@ -92,26 +92,41 @@ app.get("/play/:type/:id/:quality", async (req, res) => {
       candidateUrl = chosen.url;
     }
   } catch (err) {
-    console.error("[CineBR Router] Erro consultando BestCine:", err.message);
+    // BestCine bloqueou o IP do datacenter ou caiu
   }
 
-  // 2. Failover transparente para AllDebrid se BestCine falhar
+  // 2. Failover permanente e instantâneo para AllDebrid (Nuvem sem bloqueios 24/7)
   if (!candidateUrl) {
     try {
       const providers =
         "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
-      const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=20|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
+      const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=50|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
       const resAd = await axios.get(debridUrl, { timeout: 4000 });
       const rawStreams = resAd.data?.streams || [];
 
-      // Filtra animações e coleções velhas
+      // Filtra animações indesejadas e pacotes velhos
       const banned = /(animated|collection\s*199|colecao|desenho|parte\s*1|parte\s*2)/i;
       const validStreams = rawStreams.filter((s) => !banned.test(`${s.name || ""} ${s.title || ""}`));
 
       const ptStreams = validStreams.filter((s) =>
-        /(dublado|dual|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹)/i.test(`${s.name || ""} ${s.title || ""}`)
+        /(dublado|dual|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\.por\.)/i.test(`${s.name || ""} ${s.title || ""}`)
       );
-      const chosenAd = ptStreams[0] || validStreams[0] || rawStreams[0];
+
+      // Prioriza a qualidade pedida
+      let chosenAd = null;
+      if (quality === "4k") {
+        chosenAd = ptStreams.find((s) => /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`)) || ptStreams[0];
+      } else {
+        chosenAd =
+          ptStreams.find((s) => /(1080p|fhd)/i.test(`${s.name || ""} ${s.title || ""}`)) ||
+          ptStreams[0] ||
+          validStreams.find((s) => /(1080p|fhd)/i.test(`${s.name || ""} ${s.title || ""}`));
+      }
+
+      if (!chosenAd) {
+        chosenAd = ptStreams[0] || validStreams[0] || rawStreams[0];
+      }
+
       if (chosenAd?.url) {
         candidateUrl = chosenAd.url;
       }
@@ -124,19 +139,21 @@ app.get("/play/:type/:id/:quality", async (req, res) => {
     return res.status(404).send("Nenhum servidor disponível no momento.");
   }
 
-  // Desencapsula os redirects do Cloudflare para entregar o link final direto do vídeo MP4
-  const finalDirectUrl = await resolveFinalDirectUrl(candidateUrl);
-  console.log(`[CineBR Smart Router] Encaminhando player direto para: ${finalDirectUrl}`);
+  // Se for do BestCine, desencapsula. Se for do AllDebrid, entrega direto.
+  if (candidateUrl.includes("bestcine.dpdns.org")) {
+    const finalDirectUrl = await resolveFinalDirectUrl(candidateUrl);
+    return res.redirect(302, finalDirectUrl);
+  }
 
-  // Redireciona o player do celular/TV (302 direto pro arquivo de vídeo MP4)
-  res.redirect(302, finalDirectUrl);
+  // Redireciona o player imediatamente (AllDebrid CDN de altíssima velocidade)
+  res.redirect(302, candidateUrl);
 });
 
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "14.1.0",
-  name: "CineBR ⚡ Smart Auto (Dublado & 4K)",
-  description: "Servidores unificados em um clique com Reprodução Direta MP4 e Zero Buffer.",
+  version: "14.3.0",
+  name: "CineBR ⚡ Smart Cloud (Dublado & 4K)",
+  description: "Addon permanente na nuvem 24/7 sem bloqueio. Auto-Play inteligente direto no melhor servidor.",
   resources: ["stream"],
   types: ["movie", "series", "anime"],
   catalogs: [],
@@ -144,14 +161,15 @@ const builder = new addonBuilder({
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`[CineBR] Gerando stream unificado para ${type} ID: ${id}`);
+  console.log(`[CineBR Cloud] Gerando stream unificado para ${type} ID: ${id}`);
   
-  const baseUrl = "https://medicare-mart-corrections-contains.trycloudflare.com";
+  // Link fixo permanente na Nuvem (Render / HTTPS Oficial)
+  const baseUrl = "https://cinebr-addon.onrender.com";
 
   const streams = [
     {
       name: "⚡ CineBR [AUTO-PLAY]",
-      title: "🎬 REPRODUÇÃO INSTANTÂNEA • 1080p FULL HD\n🇧🇷 100% Dublado • Sem Seeds\n⚡ Roteador inteligente: Abre direto no melhor servidor",
+      title: "🎬 REPRODUÇÃO INSTANTÂNEA • 1080p FULL HD\n🇧🇷 100% Dublado • Sem Seeds\n⚡ Nuvem 24/7 Permanente (Zero Buffering)",
       url: `${baseUrl}/play/${type}/${id}/1080p`,
       behaviorHints: {
         bingeGroup: `cinebr-auto-1080p-${id}`,
@@ -160,7 +178,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     },
     {
       name: "💎 CineBR [AUTO-PLAY 4K]",
-      title: "🎬 REPRODUÇÃO 4K HDR UHD\n🇧🇷 100% Dublado • Sem Seeds\n⚡ Máxima Definição Instantânea",
+      title: "🎬 REPRODUÇÃO 4K HDR UHD\n🇧🇷 100% Dublado • Sem Seeds\n⚡ Máxima Definição 4K Instantânea",
       url: `${baseUrl}/play/${type}/${id}/4k`,
       behaviorHints: {
         bingeGroup: `cinebr-auto-4k-${id}`,
@@ -177,5 +195,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 14.1 Smart Auto Direct rodando na porta ${PORT}`);
+  console.log(`CineBR 14.3 Cloud Permanente rodando na porta ${PORT}`);
 });
