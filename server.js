@@ -145,6 +145,7 @@ const builder = new addonBuilder({
 
 builder.defineStreamHandler(async ({ type, id }) => {
   console.log(`[CineBR] Gerando stream unificado para ${type} ID: ${id}`);
+  
   const baseUrl = "https://medicare-mart-corrections-contains.trycloudflare.com";
 
   const streams = [
