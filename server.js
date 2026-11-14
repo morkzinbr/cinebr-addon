@@ -6,31 +6,31 @@ const ALLDEBRID_API_KEY = "LNSKQ7ZKAY45M6GRTFHK";
 
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "9.0.0",
+  version: "10.0.0",
   name: "CineBR 🇧🇷 4K UHD & Dublados",
-  description: "Filmes, séries e animes dublados PT-BR com bypass de headers e reprodução instantânea",
+  description: "Filmes, séries e animes em 4K e 1080p instantâneo (Zero Seeds) com AllDebrid CDN e servidores diretos",
   resources: ["stream"],
-  types: ["movie", "series"],
+  types: ["movie", "series", "anime"],
   catalogs: [],
-  idPrefixes: ["tt"]
+  idPrefixes: ["tt", "kitsu"]
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
   console.log(`[CineBR] Resolvendo stream para ${type} ID: ${id}`);
   let streams = [];
 
-  // 1. Tenta buscar no motor do BestCine (com os headers exatos para não dar 403)
+  // MOTOR 1: BestCine (Servidores diretos MP4/HLS quando disponível)
   try {
     const res = await axios.get(`https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": "https://bestcine.dpdns.org/"
       },
-      timeout: 6000
+      timeout: 3000
     });
 
     if (res.data?.streams && res.data.streams.length > 0) {
-      streams = res.data.streams.map(s => ({
+      const bcStreams = res.data.streams.map(s => ({
         ...s,
         name: `CineBR ⚡ ${s.name?.replace(/\n/g, ' ') || 'Direto'}`,
         title: `🇧🇷 [100% DUBLADO • SERVIDOR DIRETO]\n${s.title || ''}`,
@@ -44,36 +44,52 @@ builder.defineStreamHandler(async ({ type, id }) => {
           }
         }
       }));
+      streams.push(...bcStreams);
     }
   } catch (err) {
-    console.error("[CineBR] Falha na fonte primária BestCine:", err.message);
+    // BestCine inacessível ou bloqueado por datacenter - segue para o motor universal
   }
 
-  // 2. Se a fonte primária não tiver streams ou falhar, ativa AllDebrid Instant Cache
-  if (streams.length === 0) {
-    try {
-      const resAd = await axios.get(
-        `https://torrentio.strem.fun/providers=comando,bludv,micoleaodublado,yts,1337x,torrentgalaxy,thepiratebay|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=10|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`,
-        { timeout: 6000 }
-      );
+  // MOTOR 2: AllDebrid CDN Instantâneo Universal (Independente de FrostStream/BestCine)
+  try {
+    const providers = "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
+    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=20|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
 
-      const adStreams = resAd.data?.streams || [];
-      const ptbrAd = adStreams.filter(s => /(dublado|dual|dual audio|pt-br|ptbr|portugu|comando|bludv|micoleao|🇧🇷|🇵🇹)/i.test(`${s.name || ''} ${s.title || ''}`));
+    const resAd = await axios.get(debridUrl, { timeout: 6000 });
+    const rawStreams = resAd.data?.streams || [];
 
-      streams = (ptbrAd.length > 0 ? ptbrAd : adStreams.slice(0, 4)).map(s => ({
+    // Prioriza áudio dublado / dual / português
+    const ptRegex = /(dublado|dual|dual audio|portugu|brazil|brasil|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\bpor\b)/i;
+    const ptStreams = rawStreams.filter(s => ptRegex.test(`${s.name || ''} ${s.title || ''}`));
+    const otherStreams = rawStreams.filter(s => !ptRegex.test(`${s.name || ''} ${s.title || ''}`));
+
+    const mappedPt = ptStreams.map(s => {
+      const is4k = /4k|2160p/i.test(`${s.name || ''} ${s.title || ''}`);
+      return {
         ...s,
-        name: s.name?.includes('4k') ? 'CineBR ⚡ 4K UHD' : 'CineBR ⚡ 1080p',
+        name: is4k ? "CineBR ⚡ 4K UHD" : "CineBR ⚡ 1080p",
         title: `🇧🇷 [DUBLADO • ALLDEBRID INSTANT]\n${s.title}`
-      }));
-    } catch (errAd) {
-      console.error("[CineBR] Falha no fallback AllDebrid:", errAd.message);
-    }
+      };
+    });
+
+    const mappedOthers = otherStreams.slice(0, 6).map(s => {
+      const is4k = /4k|2160p/i.test(`${s.name || ''} ${s.title || ''}`);
+      return {
+        ...s,
+        name: is4k ? "CineBR ⚡ 4K Original" : "CineBR ⚡ 1080p Original",
+        title: `🌐 [ORIGINAL/MULTILANG • ALLDEBRID INSTANT]\n${s.title}`
+      };
+    });
+
+    streams.push(...mappedPt, ...mappedOthers);
+  } catch (errAd) {
+    console.error("[CineBR] Falha na CDN AllDebrid:", errAd.message);
   }
 
-  console.log(`[CineBR] Devolvendo ${streams.length} opções para ${id}`);
+  console.log(`[CineBR] Total de streams entregues para ${id}: ${streams.length}`);
   return { streams };
 });
 
 const PORT = process.env.PORT || 7000;
 serveHTTP(builder.getInterface(), { port: PORT });
-console.log(`CineBR 9.0 rodando na porta ${PORT}`);
+console.log(`CineBR 10.0 rodando na porta ${PORT}`);
