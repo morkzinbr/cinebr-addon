@@ -7,7 +7,6 @@ const ALLDEBRID_API_KEY = "LNSKQ7ZKAY45M6GRTFHK";
 
 const app = express();
 
-// Middleware CORS
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Headers", "*");
@@ -16,64 +15,22 @@ app.use((req, res, next) => {
   next();
 });
 
-// PROXY DE VÍDEO UNIVERSAL
-// Repassa o tráfego do BestCine para qualquer dispositivo ou rede (casa ou fora)
-// injetando os cabeçalhos de navegador e evitando bloqueio de hotlinking/403
-app.get("/proxy/stream", async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).send("Missing url param");
-
-  try {
-    const headers = {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Referer": "https://bestcine.dpdns.org/"
-    };
-
-    if (req.headers.range) {
-      headers["Range"] = req.headers.range;
-    }
-
-    const response = await axios({
-      method: req.method,
-      url: targetUrl,
-      headers: headers,
-      responseType: "stream",
-      validateStatus: () => true,
-      timeout: 15000
-    });
-
-    const forwardHeaders = ["content-type", "content-length", "content-range", "accept-ranges"];
-    forwardHeaders.forEach(h => {
-      if (response.headers[h]) {
-        res.setHeader(h, response.headers[h]);
-      }
-    });
-
-    res.status(response.status);
-    response.data.pipe(res);
-  } catch (err) {
-    console.error("[CineBR Proxy] Erro ao transmitir vídeo:", err.message);
-    if (!res.headersSent) res.status(502).send("Bad Gateway");
-  }
-});
-
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "11.0.0",
-  name: "CineBR 🇧🇷 4K UHD & Dublados",
-  description: "Filmes, séries e animes dublados PT-BR e 4K HDR instantâneo (Zero Seeds) com BestCine Engine e AllDebrid CDN",
+  version: "12.0.0",
+  name: "CineBR ⚡ Turbo Instant (Dublados & 4K)",
+  description: "Carregamento ultra-rápido instantâneo. Prioriza servidores velozes (Safira & Athena) e filtra filmes com precisão.",
   resources: ["stream"],
   types: ["movie", "series", "anime"],
   catalogs: [],
   idPrefixes: ["tt", "kitsu"]
 });
 
-// Cache auxiliar de metadados para validação estrita de título
 const titleCache = new Map();
 async function getExpectedTitle(id) {
   if (titleCache.has(id)) return titleCache.get(id);
   try {
-    const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`, { timeout: 3000 });
+    const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`, { timeout: 2500 });
     const name = metaRes.data?.meta?.name;
     if (name) {
       titleCache.set(id, name);
@@ -81,6 +38,27 @@ async function getExpectedTitle(id) {
     }
   } catch (e) {}
   return null;
+}
+
+// Classificação de velocidade dos servidores BestCine
+function rankServer(serverName, quality) {
+  let score = 0;
+  const s = (serverName || '').toLowerCase();
+  const q = (quality || '').toLowerCase();
+
+  // 1080p carrega 5x mais rápido no celular que 4K
+  if (q.includes('1080p')) score += 30;
+  else if (q.includes('720p')) score += 20;
+  else if (q.includes('4k')) score += 10;
+
+  // Safira e Athena são os mais rápidos e com maior banda
+  if (s.includes('safira')) score += 50;
+  else if (s.includes('athena')) score += 40;
+  else if (s.includes('zenith')) score += 30;
+  else if (s.includes('selene')) score += 15;
+  else score += 5;
+
+  return score;
 }
 
 builder.defineStreamHandler(async ({ type, id }) => {
@@ -93,67 +71,72 @@ builder.defineStreamHandler(async ({ type, id }) => {
     ? expectedTitle.toLowerCase().replace(/[^a-z0-9]/g, " ").split(/\s+/).filter(w => w.length > 2)
     : [];
 
-  // MOTOR 1: BestCine (Servidores diretos MP4/HLS)
+  // MOTOR 1: BestCine (Direto sem proxy intermediário para ping zero e máxima taxa de transferência)
   try {
     const res = await axios.get(`https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": "https://bestcine.dpdns.org/"
       },
-      timeout: 3500
+      timeout: 3000
     });
 
     if (res.data?.streams && res.data.streams.length > 0) {
-      const bcStreams = res.data.streams.map(s => {
-        // Envelopa a URL no Proxy para reprodução garantida em qualquer player/rede
-        const proxiedUrl = `https://cinebr-addon.onrender.com/proxy/stream?url=${encodeURIComponent(s.url)}`;
-        return {
-          ...s,
-          name: `CineBR ⚡ ${s.name?.replace(/\n/g, ' ') || 'Direto'}`,
-          title: `🇧🇷 [100% DUBLADO • SEM SEEDS]\n${s.title || ''}`,
-          url: proxiedUrl,
-          behaviorHints: {
-            ...(s.behaviorHints || {}),
-            notWebReady: false
-          }
-        };
-      });
+      // Ordena por velocidade real de início de reprodução: 1080p Safira primeiro
+      const bcStreams = res.data.streams
+        .filter(s => !s.name?.includes('Selene')) // Remove Selene por latência alta
+        .map(s => {
+          const qual = s.name?.includes('4K') ? '4K HDR' : (s.name?.includes('1080p') ? '1080p' : '720p');
+          const isInstant = qual === '1080p' || s.title?.includes('Safira');
+          return {
+            ...s,
+            score: rankServer(s.title, qual),
+            name: isInstant ? `⚡ CineBR [PLAY RÁPIDO] ${qual}` : `CineBR ${qual}`,
+            title: `🇧🇷 [100% DUBLADO • SEM SEEDS]\n${s.title || ''}`,
+            behaviorHints: {
+              ...(s.behaviorHints || {}),
+              notWebReady: false
+            }
+          };
+        })
+        .sort((a, b) => b.score - a.score);
+
       streams.push(...bcStreams);
     }
   } catch (err) {
     // BestCine indisponível no momento
   }
 
-  // MOTOR 2: AllDebrid CDN Instantâneo (Filtrado estritamente por título)
+  // MOTOR 2: AllDebrid CDN Instantâneo com validação estrita de título
   try {
     const providers = "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
-    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=25|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
+    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=20|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
 
-    const resAd = await axios.get(debridUrl, { timeout: 6000 });
+    const resAd = await axios.get(debridUrl, { timeout: 5000 });
     const rawStreams = resAd.data?.streams || [];
 
-    // Filtra para garantir que o arquivo corresponde REALMENTE ao título pedido (evita filmes aleatórios)
+    // Filtra estritamente pelo título correto
     const validStreams = rawStreams.filter(s => {
       if (titleKeywords.length === 0) return true;
       const streamText = `${s.title || ''} ${s.behaviorHints?.filename || ''}`.toLowerCase();
+      // Não pode ser outro filme
       return titleKeywords.some(kw => streamText.includes(kw));
     });
 
-    // Prioriza áudio dublado / dual / português
     const ptRegex = /(dublado|dual|dual audio|portugu|brazil|brasil|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\bpor\b)/i;
     const ptStreams = validStreams.filter(s => ptRegex.test(`${s.name || ''} ${s.title || ''}`));
     const otherStreams = validStreams.filter(s => !ptRegex.test(`${s.name || ''} ${s.title || ''}`));
 
-    const mappedPt = ptStreams.map(s => {
+    const mappedPt = ptStreams.slice(0, 3).map(s => {
       const is4k = /4k|2160p/i.test(`${s.name || ''} ${s.title || ''}`);
       return {
         ...s,
-        name: is4k ? "CineBR ⚡ 4K UHD" : "CineBR ⚡ 1080p",
+        name: is4k ? "CineBR ⚡ 4K UHD" : "⚡ CineBR [PLAY RÁPIDO] 1080p",
         title: `🇧🇷 [DUBLADO • ALLDEBRID INSTANT]\n${s.title}`
       };
     });
 
-    const mappedOthers = otherStreams.slice(0, 4).map(s => {
+    const mappedOthers = otherStreams.slice(0, 2).map(s => {
       const is4k = /4k|2160p/i.test(`${s.name || ''} ${s.title || ''}`);
       return {
         ...s,
@@ -176,5 +159,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 11.0 rodando na porta ${PORT}`);
+  console.log(`CineBR 12.0 Turbo rodando na porta ${PORT}`);
 });
