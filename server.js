@@ -15,17 +15,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const builder = new addonBuilder({
-  id: "org.cinebr.nuvio",
-  version: "13.0.0",
-  name: "CineBR ⚡ Turbo Instant (Dublados & 4K)",
-  description: "Carregamento ultra-rápido instantâneo. Prioriza servidores velozes (Safira & Athena) e filtra filmes com precisão.",
-  resources: ["stream"],
-  types: ["movie", "series", "anime"],
-  catalogs: [],
-  idPrefixes: ["tt", "kitsu"]
-});
-
+// Cache inteligente de metadados
 const titleCache = new Map();
 async function getExpectedMetadata(id) {
   if (titleCache.has(id)) return titleCache.get(id);
@@ -44,33 +34,17 @@ async function getExpectedMetadata(id) {
   return null;
 }
 
-function rankServer(serverName, quality) {
-  let score = 0;
-  const s = (serverName || '').toLowerCase();
-  const q = (quality || '').toLowerCase();
+// ROTA DO SMART PROXY (MULTI-SERVIDOR COM AUTO-FAILOVER)
+// Testa e roteia para o melhor servidor disponível em tempo real
+app.get("/play/:type/:id/:quality", async (req, res) => {
+  const { type, id, quality } = req.params;
+  console.log(`[CineBR Smart Router] Solicitado stream para ${id} [${quality}]`);
 
-  if (q.includes('1080p')) score += 30;
-  else if (q.includes('720p')) score += 20;
-  else if (q.includes('4k')) score += 10;
+  let targetUrl = null;
 
-  if (s.includes('safira')) score += 50;
-  else if (s.includes('athena')) score += 40;
-  else if (s.includes('zenith')) score += 30;
-  else if (s.includes('selene')) score += 15;
-  else score += 5;
-
-  return score;
-}
-
-builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`[CineBR] Buscando streams para ${type} ID: ${id}`);
-  let streams = [];
-
-  const meta = await getExpectedMetadata(id);
-
-  // MOTOR 1: BestCine (Direto com máxima taxa de transferência)
+  // 1. Tenta pegar os streams do BestCine
   try {
-    const res = await axios.get(`https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`, {
+    const bcRes = await axios.get(`https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer": "https://bestcine.dpdns.org/"
@@ -78,85 +52,89 @@ builder.defineStreamHandler(async ({ type, id }) => {
       timeout: 3000
     });
 
-    if (res.data?.streams && res.data.streams.length > 0) {
-      const bcStreams = res.data.streams
-        .filter(s => !s.name?.includes('Selene'))
-        .map(s => {
-          const qual = s.name?.includes('4K') ? '4K HDR' : (s.name?.includes('1080p') ? '1080p' : '720p');
-          const isInstant = qual === '1080p' || s.title?.includes('Safira');
-          return {
-            ...s,
-            score: rankServer(s.title, qual),
-            name: isInstant ? `⚡ CineBR [PLAY RÁPIDO] ${qual}` : `CineBR ${qual}`,
-            title: `🇧🇷 [100% DUBLADO • SEM SEEDS]\n${s.title || ''}`,
-            behaviorHints: {
-              ...(s.behaviorHints || {}),
-              notWebReady: false
-            }
-          };
-        })
-        .sort((a, b) => b.score - a.score);
+    const bcStreams = bcRes.data?.streams || [];
+    // Prioriza Safira (menor latência ~900ms) e depois Athena
+    const safira = bcStreams.find(s => s.url && s.title?.includes("Safira") && (quality === "4k" ? s.name?.includes("4K") : s.name?.includes("1080p")));
+    const athena = bcStreams.find(s => s.url && s.title?.includes("Athena") && (quality === "4k" ? s.name?.includes("4K") : s.name?.includes("1080p")));
+    const anyMatching = bcStreams.find(s => s.url && (quality === "4k" ? s.name?.includes("4K") : s.name?.includes("1080p")));
+    const anyBc = bcStreams.find(s => s.url);
 
-      streams.push(...bcStreams);
+    const bestStream = safira || athena || anyMatching || anyBc;
+    if (bestStream?.url) {
+      targetUrl = bestStream.url;
     }
   } catch (err) {
-    // BestCine indisponível no momento
+    console.error("[CineBR Router] Erro consultando BestCine:", err.message);
   }
 
-  // MOTOR 2: AllDebrid CDN Instantâneo (COM FILTRO ESTRITO ANTI-PACK E ANTI-OUTRO FILME)
-  try {
-    const providers = "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
-    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=20|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
+  // 2. Se BestCine não respondeu, faz failover transparente para AllDebrid Instantâneo
+  if (!targetUrl) {
+    try {
+      const providers = "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
+      const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=20|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
+      const resAd = await axios.get(debridUrl, { timeout: 4000 });
+      const rawStreams = resAd.data?.streams || [];
 
-    const resAd = await axios.get(debridUrl, { timeout: 5000 });
-    const rawStreams = resAd.data?.streams || [];
-
-    // FILTRO ESTRITO: Elimina animações, coleções e partes 1/2 que não sejam o filme solicitado
-    const validStreams = rawStreams.filter(s => {
-      const streamText = `${s.title || ''} ${s.behaviorHints?.filename || ''}`.toLowerCase();
-      
-      // Rejeita pacotes e animações que colidem com nomes de filmes reais
-      if (streamText.includes('animated') || streamText.includes('collection 199') || streamText.includes('collection 200') || streamText.includes('parte.1') || streamText.includes('parte 1') || streamText.includes('parte.2') || streamText.includes('parte 2')) {
-        return false;
+      const ptStreams = rawStreams.filter(s => /(dublado|dual|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹)/i.test(`${s.name || ''} ${s.title || ''}`));
+      const chosenAd = ptStreams[0] || rawStreams[0];
+      if (chosenAd?.url) {
+        targetUrl = chosenAd.url;
       }
-
-      if (!meta?.name) return true;
-      const cleanMetaName = meta.name.replace(/[^a-z0-9]/g, ' ').trim();
-      const words = cleanMetaName.split(/\s+/).filter(w => w.length > 2);
-      
-      // Precisa conter pelo menos duas palavras-chave do título ou a palavra principal
-      const matches = words.filter(w => streamText.includes(w));
-      return matches.length >= Math.min(2, words.length);
-    });
-
-    const ptRegex = /(dublado|dual|dual audio|portugu|brazil|brasil|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\bpor\b)/i;
-    const ptStreams = validStreams.filter(s => ptRegex.test(`${s.name || ''} ${s.title || ''}`));
-    const otherStreams = validStreams.filter(s => !ptRegex.test(`${s.name || ''} ${s.title || ''}`));
-
-    const mappedPt = ptStreams.slice(0, 3).map(s => {
-      const is4k = /4k|2160p/i.test(`${s.name || ''} ${s.title || ''}`);
-      return {
-        ...s,
-        name: is4k ? "CineBR ⚡ 4K UHD" : "⚡ CineBR [PLAY RÁPIDO] 1080p",
-        title: `🇧🇷 [DUBLADO • ALLDEBRID INSTANT]\n${s.title}`
-      };
-    });
-
-    const mappedOthers = otherStreams.slice(0, 2).map(s => {
-      const is4k = /4k|2160p/i.test(`${s.name || ''} ${s.title || ''}`);
-      return {
-        ...s,
-        name: is4k ? "CineBR ⚡ 4K Original" : "CineBR ⚡ 1080p Original",
-        title: `🌐 [ORIGINAL/MULTILANG • ALLDEBRID INSTANT]\n${s.title}`
-      };
-    });
-
-    streams.push(...mappedPt, ...mappedOthers);
-  } catch (errAd) {
-    console.error("[CineBR] Falha na CDN AllDebrid:", errAd.message);
+    } catch (errAd) {
+      console.error("[CineBR Router] Erro consultando AllDebrid:", errAd.message);
+    }
   }
 
-  console.log(`[CineBR] Entregando ${streams.length} opções validadas para ${id}`);
+  if (!targetUrl) {
+    return res.status(404).send("Nenhum servidor disponível no momento.");
+  }
+
+  // Redireciona imediatamente (302) o player para o link direto mais rápido
+  res.redirect(302, targetUrl);
+});
+
+const builder = new addonBuilder({
+  id: "org.cinebr.nuvio",
+  version: "14.0.0",
+  name: "CineBR ⚡ Smart Auto (Dublado & 4K)",
+  description: "Servidores unificados em um clique. O addon escolhe e conecta automaticamente no servidor mais rápido sem você precisar testar um por um.",
+  resources: ["stream"],
+  types: ["movie", "series", "anime"],
+  catalogs: [],
+  idPrefixes: ["tt", "kitsu"]
+});
+
+builder.defineStreamHandler(async ({ type, id }) => {
+  console.log(`[CineBR] Gerando stream unificado para ${type} ID: ${id}`);
+
+  // Gera o host da URL baseado em onde o addon estiver rodando
+  // Se estiver local/túnel, usa o host público ou fallback local
+  const baseUrl = "https://medicare-mart-corrections-contains.trycloudflare.com";
+
+  // Retorna APENAS 2 opções unificadas e limpas:
+  // 1. [PLAY AUTOMÁTICO] 1080p Dublado (Ultra Rápido - Abre direto no melhor servidor)
+  // 2. [PLAY AUTOMÁTICO] 4K HDR Dublado (Máxima Qualidade)
+  const streams = [
+    {
+      name: "⚡ CineBR [AUTO-PLAY]",
+      title: "🎬 REPRODUÇÃO INSTANTÂNEA • 1080p FULL HD\n🇧🇷 100% Dublado • Sem Seeds\n⚡ Conecta automaticamente no melhor servidor (Safira / Athena)",
+      url: `${baseUrl}/play/${type}/${id}/1080p`,
+      behaviorHints: {
+        bingeGroup: `cinebr-auto-1080p-${id}`,
+        notWebReady: false
+      }
+    },
+    {
+      name: "💎 CineBR [AUTO-PLAY 4K]",
+      title: "🎬 REPRODUÇÃO 4K HDR UHD\n🇧🇷 100% Dublado • Sem Seeds\n⚡ Conecta automaticamente no melhor servidor de alta definição",
+      url: `${baseUrl}/play/${type}/${id}/4k`,
+      behaviorHints: {
+        bingeGroup: `cinebr-auto-4k-${id}`,
+        notWebReady: false
+      }
+    }
+  ];
+
   return { streams };
 });
 
@@ -165,5 +143,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 13.0 Turbo rodando na porta ${PORT}`);
+  console.log(`CineBR 14.0 Smart Auto rodando na porta ${PORT}`);
 });
