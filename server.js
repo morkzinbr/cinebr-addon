@@ -17,7 +17,7 @@ app.use((req, res, next) => {
 
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "12.0.0",
+  version: "13.0.0",
   name: "CineBR ⚡ Turbo Instant (Dublados & 4K)",
   description: "Carregamento ultra-rápido instantâneo. Prioriza servidores velozes (Safira & Athena) e filtra filmes com precisão.",
   resources: ["stream"],
@@ -27,31 +27,32 @@ const builder = new addonBuilder({
 });
 
 const titleCache = new Map();
-async function getExpectedTitle(id) {
+async function getExpectedMetadata(id) {
   if (titleCache.has(id)) return titleCache.get(id);
   try {
     const metaRes = await axios.get(`https://v3-cinemeta.strem.io/meta/movie/${id}.json`, { timeout: 2500 });
-    const name = metaRes.data?.meta?.name;
-    if (name) {
-      titleCache.set(id, name);
-      return name;
+    const meta = metaRes.data?.meta;
+    if (meta?.name) {
+      const data = {
+        name: meta.name.toLowerCase(),
+        year: meta.year ? parseInt(meta.year) : null
+      };
+      titleCache.set(id, data);
+      return data;
     }
   } catch (e) {}
   return null;
 }
 
-// Classificação de velocidade dos servidores BestCine
 function rankServer(serverName, quality) {
   let score = 0;
   const s = (serverName || '').toLowerCase();
   const q = (quality || '').toLowerCase();
 
-  // 1080p carrega 5x mais rápido no celular que 4K
   if (q.includes('1080p')) score += 30;
   else if (q.includes('720p')) score += 20;
   else if (q.includes('4k')) score += 10;
 
-  // Safira e Athena são os mais rápidos e com maior banda
   if (s.includes('safira')) score += 50;
   else if (s.includes('athena')) score += 40;
   else if (s.includes('zenith')) score += 30;
@@ -65,13 +66,9 @@ builder.defineStreamHandler(async ({ type, id }) => {
   console.log(`[CineBR] Buscando streams para ${type} ID: ${id}`);
   let streams = [];
 
-  // Obter título original para filtrar torrents errôneos
-  const expectedTitle = await getExpectedTitle(id);
-  const titleKeywords = expectedTitle
-    ? expectedTitle.toLowerCase().replace(/[^a-z0-9]/g, " ").split(/\s+/).filter(w => w.length > 2)
-    : [];
+  const meta = await getExpectedMetadata(id);
 
-  // MOTOR 1: BestCine (Direto sem proxy intermediário para ping zero e máxima taxa de transferência)
+  // MOTOR 1: BestCine (Direto com máxima taxa de transferência)
   try {
     const res = await axios.get(`https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`, {
       headers: {
@@ -82,9 +79,8 @@ builder.defineStreamHandler(async ({ type, id }) => {
     });
 
     if (res.data?.streams && res.data.streams.length > 0) {
-      // Ordena por velocidade real de início de reprodução: 1080p Safira primeiro
       const bcStreams = res.data.streams
-        .filter(s => !s.name?.includes('Selene')) // Remove Selene por latência alta
+        .filter(s => !s.name?.includes('Selene'))
         .map(s => {
           const qual = s.name?.includes('4K') ? '4K HDR' : (s.name?.includes('1080p') ? '1080p' : '720p');
           const isInstant = qual === '1080p' || s.title?.includes('Safira');
@@ -107,7 +103,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
     // BestCine indisponível no momento
   }
 
-  // MOTOR 2: AllDebrid CDN Instantâneo com validação estrita de título
+  // MOTOR 2: AllDebrid CDN Instantâneo (COM FILTRO ESTRITO ANTI-PACK E ANTI-OUTRO FILME)
   try {
     const providers = "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
     const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=20|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
@@ -115,12 +111,22 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const resAd = await axios.get(debridUrl, { timeout: 5000 });
     const rawStreams = resAd.data?.streams || [];
 
-    // Filtra estritamente pelo título correto
+    // FILTRO ESTRITO: Elimina animações, coleções e partes 1/2 que não sejam o filme solicitado
     const validStreams = rawStreams.filter(s => {
-      if (titleKeywords.length === 0) return true;
       const streamText = `${s.title || ''} ${s.behaviorHints?.filename || ''}`.toLowerCase();
-      // Não pode ser outro filme
-      return titleKeywords.some(kw => streamText.includes(kw));
+      
+      // Rejeita pacotes e animações que colidem com nomes de filmes reais
+      if (streamText.includes('animated') || streamText.includes('collection 199') || streamText.includes('collection 200') || streamText.includes('parte.1') || streamText.includes('parte 1') || streamText.includes('parte.2') || streamText.includes('parte 2')) {
+        return false;
+      }
+
+      if (!meta?.name) return true;
+      const cleanMetaName = meta.name.replace(/[^a-z0-9]/g, ' ').trim();
+      const words = cleanMetaName.split(/\s+/).filter(w => w.length > 2);
+      
+      // Precisa conter pelo menos duas palavras-chave do título ou a palavra principal
+      const matches = words.filter(w => streamText.includes(w));
+      return matches.length >= Math.min(2, words.length);
     });
 
     const ptRegex = /(dublado|dual|dual audio|portugu|brazil|brasil|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\bpor\b)/i;
@@ -159,5 +165,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 12.0 Turbo rodando na porta ${PORT}`);
+  console.log(`CineBR 13.0 Turbo rodando na porta ${PORT}`);
 });
