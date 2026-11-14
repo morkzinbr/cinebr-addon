@@ -21,65 +21,11 @@ function parseSize(s) {
   return match[2].toUpperCase() === "MB" ? num / 1024 : num;
 }
 
-// ROTA DO SMART ROUTER - AUTO-PLAY ULTRA RÁPIDO (LEVE & SEM ESPERA)
-app.get("/play/:type/:id/:quality", async (req, res) => {
-  const { type, id, quality } = req.params;
-  console.log(`[CineBR Turbo Router] Solicitado stream para ${id} [${quality}]`);
-
-  let targetUrl = null;
-
-  try {
-    const providers =
-      "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
-    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=50|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
-
-    const resAd = await axios.get(debridUrl, { timeout: 3500 });
-    const rawStreams = resAd.data?.streams || [];
-
-    // 1. Elimina animações / desenhos intrusos
-    const banned = /(animated|collection\s*199|colecao|desenho|parte\s*1|parte\s*2)/i;
-    const validStreams = rawStreams.filter((s) => !banned.test(`${s.name || ""} ${s.title || ""}`));
-
-    // 2. Filtra áudio Dublado / Dual / Multi / PT-BR
-    const ptStreams = validStreams.filter((s) =>
-      /(dublado|dual|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\.por\.)/i.test(`${s.name || ""} ${s.title || ""}`)
-    );
-
-    const pool = ptStreams.length > 0 ? ptStreams : validStreams;
-
-    // 3. SELEÇÃO TURBO: Evita Remux pesados de 60GB-70GB.
-    // Escolhe versões otimizadas de 2GB a 8GB que iniciam em 0.5 segundo!
-    if (quality === "4k") {
-      const k4 = pool.filter((s) => /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`));
-      // Prefere arquivos de 3GB a 12GB para abrir instantâneo
-      const fast4k = k4.filter((s) => parseSize(s) >= 2 && parseSize(s) <= 15);
-      const chosen = fast4k[0] || k4[0] || pool[0];
-      targetUrl = chosen?.url;
-    } else {
-      // 1080p
-      const fhd = pool.filter((s) => /(1080p|fhd)/i.test(`${s.name || ""} ${s.title || ""}`));
-      // Prefere arquivos leves de 1.5GB a 6GB (reprodução imediata)
-      const fastFhd = fhd.filter((s) => parseSize(s) >= 1 && parseSize(s) <= 6);
-      const chosen = fastFhd[0] || fhd[0] || pool[0];
-      targetUrl = chosen?.url;
-    }
-  } catch (err) {
-    console.error("[CineBR Turbo Router] Erro:", err.message);
-  }
-
-  if (!targetUrl) {
-    return res.status(404).send("Stream não encontrado.");
-  }
-
-  // Redireciona o player imediatamente (HTTP 302 direto pro stream de alta velocidade)
-  res.redirect(302, targetUrl);
-});
-
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "14.4.0",
-  name: "CineBR ⚡ Turbo Instant (Dublado & 4K)",
-  description: "Nuvem 24/7 permanente com carregamento instantâneo em 0.5s (Zero Buffer).",
+  version: "15.0.0",
+  name: "CineBR ⚡ Direto (Dublado & 4K)",
+  description: "Links Diretos do AllDebrid na Nuvem sem intermediários. Abre na hora!",
   resources: ["stream"],
   types: ["movie", "series", "anime"],
   catalogs: [],
@@ -87,31 +33,51 @@ const builder = new addonBuilder({
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`[CineBR Turbo] Entregando streams instantâneos para ${type} ID: ${id}`);
-  const baseUrl = "https://cinebr-addon.onrender.com";
+  console.log(`[CineBR 15.0] Buscando streams diretos para ${type} ID: ${id}`);
 
-  const streams = [
-    {
-      name: "⚡ CineBR [PLAY INSTANTÂNEO]",
-      title: "🎬 REPRODUÇÃO INSTANTÂNEA • 1080p FULL HD\n🇧🇷 100% Dublado • Sem Espera (0.5s Play)\n⚡ Otimizado para não travar nem carregar",
-      url: `${baseUrl}/play/${type}/${id}/1080p`,
-      behaviorHints: {
-        bingeGroup: `cinebr-turbo-1080p-${id}`,
-        notWebReady: false
-      }
-    },
-    {
-      name: "💎 CineBR [PLAY TURBO 4K]",
-      title: "🎬 REPRODUÇÃO TURBO 4K HDR\n🇧🇷 100% Dublado • Alta Velocidade\n⚡ Qualidade Máxima sem Engasgos",
-      url: `${baseUrl}/play/${type}/${id}/4k`,
-      behaviorHints: {
-        bingeGroup: `cinebr-turbo-4k-${id}`,
-        notWebReady: false
-      }
+  try {
+    const providers =
+      "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
+    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=50|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
+
+    const resAd = await axios.get(debridUrl, { timeout: 4000 });
+    const rawStreams = resAd.data?.streams || [];
+
+    // Filtra animações intrusas e pacotes velhos
+    const banned = /(animated|collection\s*199|colecao|desenho|parte\s*1|parte\s*2)/i;
+    const validStreams = rawStreams.filter((s) => !banned.test(`${s.name || ""} ${s.title || ""}`));
+
+    // Filtra streams dublados / nacionais
+    const ptStreams = validStreams.filter((s) =>
+      /(dublado|dual|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\.por\.)/i.test(`${s.name || ""} ${s.title || ""}`)
+    );
+
+    const pool = ptStreams.length > 0 ? ptStreams : validStreams;
+
+    // Converte e entrega os streams diretamente COM A URL FINAL NATIVA
+    const resultStreams = pool.slice(0, 4).map((s, idx) => {
+      const is4k = /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`);
+      const isDub = /(dublado|dual|pt-br|ptbr|🇧🇷|🇵🇹|\.por\.)/i.test(`${s.name || ""} ${s.title || ""}`);
+      
+      const badge = isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL / MULTI";
+      const qualityTag = is4k ? "4K UHD" : "1080p FULL HD";
+
+      return {
+        name: `⚡ CineBR [${qualityTag}]`,
+        title: `🎬 ${s.title.split('\n')[0]}\n${badge} • ALLDEBRID INSTANT\n⚡ ${s.title.split('\n')[1] || ''}`,
+        url: s.url,
+        behaviorHints: s.behaviorHints || { notWebReady: false }
+      };
+    });
+
+    if (resultStreams.length > 0) {
+      return { streams: resultStreams };
     }
-  ];
+  } catch (err) {
+    console.error("[CineBR 15.0] Erro:", err.message);
+  }
 
-  return { streams };
+  return { streams: [] };
 });
 
 const addonInterface = builder.getInterface();
@@ -119,5 +85,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 14.4 Turbo Instant rodando na porta ${PORT}`);
+  console.log(`CineBR 15.0 Direto rodando na porta ${PORT}`);
 });
