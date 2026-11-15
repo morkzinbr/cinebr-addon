@@ -17,7 +17,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Desencapsula os 302/307 do BestCine para entregar direto o MP4 CDN
 function resolveFinalDirectUrl(urlStr, maxRedirects = 6) {
   return new Promise((resolve) => {
     function step(currentUrl, count) {
@@ -66,9 +65,9 @@ function parseSize(s) {
 
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "17.1.0",
-  name: "CineBR ⚡ Cloud 24/7 (Dublado & Projetor)",
-  description: "Link permanente na nuvem sem precisar do PC ligado. 100% Dublado PT-BR e Otimizado para Projetor.",
+  version: "18.0.0",
+  name: "CineBR ⚡ Duas Opções (1080p & 4K)",
+  description: "Exatamente 2 opções limpas: 1080p Full HD (Projetor/Celular) e 4K HDR (Smart TV).",
   resources: ["stream"],
   types: ["movie", "series", "anime"],
   catalogs: [],
@@ -76,10 +75,11 @@ const builder = new addonBuilder({
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`[CineBR 17.1 Cloud] Buscando streams para ${type} ID: ${id}`);
-  const streams = [];
+  console.log(`[CineBR 18.0] Buscando streams para ${type} ID: ${id}`);
+  let stream1080 = null;
+  let stream4k = null;
 
-  // 1. TENTA BESTCINE (SE ESTIVER LOCAL OU COM PROXY)
+  // 1. TENTA PRIMEIRO NO BESTCINE
   try {
     const bcRes = await axios.get(`https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`, {
       headers: {
@@ -100,27 +100,27 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     if (bc1080) {
       const directUrl = await resolveFinalDirectUrl(bc1080.url);
-      streams.push({
-        name: "⚡ CineBR [1080p PROJETOR]",
+      stream1080 = {
+        name: "⚡ CineBR [1080p FULL HD]",
         title: "🎬 1080p FULL HD • ÁUDIO DUBLADO (BRASIL)\n⚡ Otimizado para Projetor e Celular (Zero Travamento)",
         url: directUrl,
         behaviorHints: { notWebReady: false }
-      });
+      };
     }
 
     if (bc4k) {
       const directUrl = await resolveFinalDirectUrl(bc4k.url);
-      streams.push({
-        name: "💎 CineBR [4K ULTRA TV]",
+      stream4k = {
+        name: "💎 CineBR [4K HDR ULTRA]",
         title: "🎬 4K HDR ULTRA HD • ÁUDIO DUBLADO (BRASIL)\n⚡ Máxima Definição para Smart TV",
         url: directUrl,
         behaviorHints: { notWebReady: false }
-      });
+      };
     }
   } catch (e) {}
 
-  // 2. SE NÃO VEIO DO BESTCINE (EX: NA NUVEM DO RENDER), USA O ALLDEBRID NATIVO 24/7
-  if (streams.length === 0) {
+  // 2. SE FALTAR 1080p OU 4K (OU RODANDO NA NUVEM), COMPLETA COM ALLDEBRID NATIVO 24/7
+  if (!stream1080 || !stream4k) {
     try {
       const providers =
         "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
@@ -129,11 +129,10 @@ builder.defineStreamHandler(async ({ type, id }) => {
       const resAd = await axios.get(debridUrl, { timeout: 4000 });
       const rawStreams = resAd.data?.streams || [];
 
-      // Filtra animações e coleções intrusas
+      // Filtra animações e coleções velhas
       const banned = /(animated|collection\s*199|colecao|desenho|parte\s*1|parte\s*2)/i;
       const validStreams = rawStreams.filter((s) => !banned.test(`${s.name || ""} ${s.title || ""}`));
 
-      // Validação estrita de Português (ignora espanhol/cinecalidad/dual-lat)
       function isRealPt(s) {
         const title = `${s.name || ""} ${s.title || ""}`;
         if (/(cinecalidad|dual-lat|\.lat\.|latino|castellano|espanol|spanish|mexico|argentina)/i.test(title)) {
@@ -147,59 +146,62 @@ builder.defineStreamHandler(async ({ type, id }) => {
         return /\b(camrip|telesync|hdcam|hdts)\b/i.test(text) || /\bcam\b/i.test(s.name || "");
       }
 
-      const ptStreams = validStreams.filter((s) => isRealPt(s) && !isCamQuality(s));
-      const originalHd = validStreams.filter((s) => !isCamQuality(s));
-      const anyCam = validStreams.filter((s) => isCamQuality(s));
+      // --- BUSCA O MELHOR 1080p ---
+      if (!stream1080) {
+        // Prioriza 1080p Dublado leve
+        const pt1080 = validStreams.filter((s) => isRealPt(s) && /(1080p|fhd)/i.test(`${s.name || ""} ${s.title || ""}`) && !isCamQuality(s));
+        const any1080 = validStreams.filter((s) => /(1080p|fhd)/i.test(`${s.name || ""} ${s.title || ""}`) && !isCamQuality(s));
+        const cam1080 = validStreams.filter((s) => isCamQuality(s));
 
-      const pool = ptStreams.length > 0 ? ptStreams : (originalHd.length > 0 ? originalHd : anyCam);
+        const chosen1080 = pt1080.find((s) => parseSize(s) <= 12) || pt1080[0] ||
+                           any1080.find((s) => parseSize(s) <= 8) || any1080[0] ||
+                           cam1080[0];
 
-      // 1. Opção 1080p Leve para Projetor (reprodução suave)
-      const fhdStream = pool.find((s) => /(1080p|fhd)/i.test(`${s.name || ""} ${s.title || ""}`) && parseSize(s) <= 12) ||
-                        pool.find((s) => /(1080p|fhd)/i.test(`${s.name || ""} ${s.title || ""}`));
+        if (chosen1080) {
+          const isDub = isRealPt(chosen1080);
+          const isCam = isCamQuality(chosen1080);
+          const qName = isCam ? "CINEMA CAM" : "1080p FULL HD";
+          const aName = isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL / LEGENDADO";
 
-      // 2. Opção 4K HDR para Smart TV
-      const k4Stream = pool.find((s) => /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`));
-
-      if (fhdStream) {
-        const isDub = isRealPt(fhdStream);
-        const isCam = isCamQuality(fhdStream);
-        let qTag = isCam ? "CINEMA CAM" : "1080p PROJETOR";
-        let aTag = isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL / LEGENDADO";
-
-        streams.push({
-          name: `⚡ CineBR [${qTag}]`,
-          title: `🎬 ${fhdStream.title.split('\n')[0]}\n${aTag} • ALLDEBRID 24/7\n⚡ Otimizado para Projetor (Leve & Sem Travamentos)`,
-          url: fhdStream.url,
-          behaviorHints: fhdStream.behaviorHints || { notWebReady: false }
-        });
+          stream1080 = {
+            name: `⚡ CineBR [${qName}]`,
+            title: `🎬 1080p • ${aName}\n⚡ ${chosen1080.title.split('\n')[0]}\n⚡ Otimizado para Projetor (Leve & Sem Travamentos)`,
+            url: chosen1080.url,
+            behaviorHints: chosen1080.behaviorHints || { notWebReady: false }
+          };
+        }
       }
 
-      if (k4Stream && k4Stream !== fhdStream) {
-        const isDub = isRealPt(k4Stream);
-        streams.push({
-          name: "💎 CineBR [4K ULTRA TV]",
-          title: `🎬 ${k4Stream.title.split('\n')[0]}\n${isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL"} • ALLDEBRID 24/7\n⚡ Máxima Definição 4K HDR`,
-          url: k4Stream.url,
-          behaviorHints: k4Stream.behaviorHints || { notWebReady: false }
-        });
-      }
+      // --- BUSCA O MELHOR 4K ---
+      if (!stream4k) {
+        const pt4k = validStreams.filter((s) => isRealPt(s) && /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`) && !isCamQuality(s));
+        const any4k = validStreams.filter((s) => /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`) && !isCamQuality(s));
 
-      // Se não achou nem 1080p nem 4k, pega o primeiro da pool
-      if (streams.length === 0 && pool.length > 0) {
-        const first = pool[0];
-        streams.push({
-          name: "⚡ CineBR [PLAY DIRETO]",
-          title: `🎬 ${first.title.split('\n')[0]}\nALLDEBRID 24/7 NUVEM`,
-          url: first.url,
-          behaviorHints: first.behaviorHints || { notWebReady: false }
-        });
+        const chosen4k = pt4k[0] || any4k[0];
+        if (chosen4k) {
+          const isDub = isRealPt(chosen4k);
+          const aName = isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL / LEGENDADO";
+
+          stream4k = {
+            name: "💎 CineBR [4K HDR ULTRA]",
+            title: `🎬 4K UHD • ${aName}\n⚡ ${chosen4k.title.split('\n')[0]}\n⚡ Máxima Definição para Smart TV`,
+            url: chosen4k.url,
+            behaviorHints: chosen4k.behaviorHints || { notWebReady: false }
+          };
+        }
       }
     } catch (err) {
-      console.error("[CineBR] Erro Debrid Nuvem:", err.message);
+      console.error("[CineBR 18.0] Erro:", err.message);
     }
   }
 
-  return { streams };
+  // RETORNA EXATAMENTE AS DUAS OPÇÕES LIMPAS
+  const finalStreams = [];
+  if (stream1080) finalStreams.push(stream1080);
+  if (stream4k) finalStreams.push(stream4k);
+
+  // Se por algum motivo só achou uma qualidade (ex: filme velho que não tem 4K), entrega a disponível
+  return { streams: finalStreams };
 });
 
 const addonInterface = builder.getInterface();
@@ -207,5 +209,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 17.1 Universal Cloud rodando na porta ${PORT}`);
+  console.log(`CineBR 18.0 Duas Opções rodando na porta ${PORT}`);
 });
