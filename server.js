@@ -14,18 +14,11 @@ app.use((req, res, next) => {
   next();
 });
 
-function parseSize(s) {
-  const match = (s.title || "").match(/💾\s*([\d\.]+)\s*(GB|MB)/i);
-  if (!match) return 999;
-  const num = parseFloat(match[1]);
-  return match[2].toUpperCase() === "MB" ? num / 1024 : num;
-}
-
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "15.0.0",
-  name: "CineBR ⚡ Direto (Dublado & 4K)",
-  description: "Links Diretos do AllDebrid na Nuvem sem intermediários. Abre na hora!",
+  version: "15.1.0",
+  name: "CineBR ⚡ Full (Dublados & Cinema)",
+  description: "Filmes oficiais em HD/4K Dublados e lançamentos recentes de cinema via AllDebrid.",
   resources: ["stream"],
   types: ["movie", "series", "anime"],
   catalogs: [],
@@ -33,38 +26,42 @@ const builder = new addonBuilder({
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`[CineBR 15.0] Buscando streams diretos para ${type} ID: ${id}`);
+  console.log(`[CineBR 15.1] Buscando streams para ${type} ID: ${id}`);
 
   try {
     const providers =
       "yts,eztv,rarbg,1337x,thepiratebay,kickasstorrents,torrentgalaxy,magnetdl,horriblesubs,nyaasi,tokyotosho,anidex,comando,bludv,micoleaodublado,cinecalidad,besttorrents";
-    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|qualityfilter=scr,cam|debridoptions=nodownloadlinks|limit=50|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
+    // Sem filtrar CAM para garantir que filmes recém-saídos do cinema (ex: Whalefall, Godzilla) apareçam!
+    const debridUrl = `https://torrentio.strem.fun/providers=${providers}|sort=qualitysize|debridoptions=nodownloadlinks|limit=50|alldebrid=${ALLDEBRID_API_KEY}/stream/${type}/${id}.json`;
 
     const resAd = await axios.get(debridUrl, { timeout: 4000 });
     const rawStreams = resAd.data?.streams || [];
 
-    // Filtra animações intrusas e pacotes velhos
+    // Filtra animações e coleções intrusas
     const banned = /(animated|collection\s*199|colecao|desenho|parte\s*1|parte\s*2)/i;
     const validStreams = rawStreams.filter((s) => !banned.test(`${s.name || ""} ${s.title || ""}`));
 
-    // Filtra streams dublados / nacionais
+    // Separa streams dublados
     const ptStreams = validStreams.filter((s) =>
       /(dublado|dual|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\.por\.)/i.test(`${s.name || ""} ${s.title || ""}`)
     );
 
+    // Se tiver dublado, usa dublado. Se for filme novo que só tem versão de cinema/original, usa o melhor disponível!
     const pool = ptStreams.length > 0 ? ptStreams : validStreams;
 
-    // Converte e entrega os streams diretamente COM A URL FINAL NATIVA
-    const resultStreams = pool.slice(0, 4).map((s, idx) => {
+    const resultStreams = pool.slice(0, 5).map((s) => {
       const is4k = /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`);
       const isDub = /(dublado|dual|pt-br|ptbr|🇧🇷|🇵🇹|\.por\.)/i.test(`${s.name || ""} ${s.title || ""}`);
-      
-      const badge = isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL / MULTI";
-      const qualityTag = is4k ? "4K UHD" : "1080p FULL HD";
+      const isCam = /(cam|telesync|ts|hdcam)/i.test(`${s.name || ""} ${s.title || ""}`);
+
+      let qualityTag = is4k ? "4K UHD" : "1080p FULL HD";
+      if (isCam) qualityTag = "CINEMA CAM";
+
+      const badge = isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL / LEGENDADO";
 
       return {
         name: `⚡ CineBR [${qualityTag}]`,
-        title: `🎬 ${s.title.split('\n')[0]}\n${badge} • ALLDEBRID INSTANT\n⚡ ${s.title.split('\n')[1] || ''}`,
+        title: `🎬 ${s.title.split('\n')[0]}\n${badge} • REPRODUÇÃO DIRETA\n⚡ ${s.title.split('\n')[1] || ''}`,
         url: s.url,
         behaviorHints: s.behaviorHints || { notWebReady: false }
       };
@@ -74,7 +71,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
       return { streams: resultStreams };
     }
   } catch (err) {
-    console.error("[CineBR 15.0] Erro:", err.message);
+    console.error("[CineBR 15.1] Erro:", err.message);
   }
 
   return { streams: [] };
@@ -85,5 +82,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 15.0 Direto rodando na porta ${PORT}`);
+  console.log(`CineBR 15.1 Full rodando na porta ${PORT}`);
 });
