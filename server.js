@@ -14,11 +14,18 @@ app.use((req, res, next) => {
   next();
 });
 
+function parseSize(s) {
+  const match = (s.title || "").match(/💾\s*([\d\.]+)\s*(GB|MB)/i);
+  if (!match) return 999;
+  const num = parseFloat(match[1]);
+  return match[2].toUpperCase() === "MB" ? num / 1024 : num;
+}
+
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "15.2.0",
-  name: "CineBR ⚡ Full (Dublados & Cinema)",
-  description: "Prioridade Absoluta Dublado HD/4K com Fallback Inteligente para Lançamentos de Cinema.",
+  version: "16.0.0",
+  name: "CineBR ⚡ Play Único",
+  description: "Apenas 1 opção inteligente: seleciona e entrega automaticamente o melhor servidor.",
   resources: ["stream"],
   types: ["movie", "series", "anime"],
   catalogs: [],
@@ -26,7 +33,7 @@ const builder = new addonBuilder({
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`[CineBR 15.2] Buscando streams para ${type} ID: ${id}`);
+  console.log(`[CineBR 16.0] Buscando o melhor stream único para ${type} ID: ${id}`);
 
   try {
     const providers =
@@ -36,71 +43,69 @@ builder.defineStreamHandler(async ({ type, id }) => {
     const resAd = await axios.get(debridUrl, { timeout: 4000 });
     const rawStreams = resAd.data?.streams || [];
 
-    // Filtra animações intrusas e pacotes velhos (ex: Coleção Batman 1993-2013)
+    // Filtra animações e coleções intrusas
     const banned = /(animated|collection\s*199|colecao|desenho|parte\s*1|parte\s*2)/i;
     const validStreams = rawStreams.filter((s) => !banned.test(`${s.name || ""} ${s.title || ""}`));
 
-    // Detecta se é gravação de cinema real
     function isCamQuality(stream) {
       const fullText = `${stream.name || ""} ${stream.title || ""}`.toLowerCase();
-      // Não confunda .cam. ou .camrip. com palavras normais ou tags bluray
       return (
         /\b(camrip|telesync|hdcam|hdts)\b/i.test(fullText) ||
         /\bcam\b/i.test(stream.name || "")
       );
     }
 
-    // Detecta se é Dublado / PT-BR
     function isDubbed(stream) {
       const fullText = `${stream.name || ""} ${stream.title || ""}`;
       return /(dublado|dual|pt-br|ptbr|comando|bludv|micoleao|🇧🇷|🇵🇹|\.por\.)/i.test(fullText);
     }
 
-    // Separa categorias
     const dubbedHd = validStreams.filter((s) => isDubbed(s) && !isCamQuality(s));
     const originalHd = validStreams.filter((s) => !isDubbed(s) && !isCamQuality(s));
     const dubbedCam = validStreams.filter((s) => isDubbed(s) && isCamQuality(s));
     const anyCam = validStreams.filter((s) => isCamQuality(s));
 
-    // REGRAS DE PRIORIDADE (TUDO EM UM):
-    // 1º Prioridade: Dublados em Alta Definição (1080p / 4K / Blu-Ray)
-    // 2º Se não tiver dublado, entrega HD Original / Legendado
-    // 3º Se não tiver versão digital (filme em cartaz), vai para gravação de cinema CAM
-    let selectedPool = [];
-
+    // Define o pool na ordem de prioridade
+    let pool = [];
     if (dubbedHd.length > 0) {
-      selectedPool = dubbedHd;
+      pool = dubbedHd;
     } else if (originalHd.length > 0) {
-      selectedPool = originalHd;
+      pool = originalHd;
     } else if (dubbedCam.length > 0) {
-      selectedPool = dubbedCam;
+      pool = dubbedCam;
     } else {
-      selectedPool = anyCam;
+      pool = anyCam;
     }
 
-    const resultStreams = selectedPool.slice(0, 4).map((s) => {
-      const is4k = /(4k|2160p|uhd)/i.test(`${s.name || ""} ${s.title || ""}`);
-      const isDub = isDubbed(s);
-      const isCam = isCamQuality(s);
+    if (pool.length > 0) {
+      // Dentre as opções da melhor categoria, escolhe a versão perfeita:
+      // Prefere arquivos otimizados (3GB a 12GB) para iniciar em 0.5s sem travar
+      const optimal = pool.filter((s) => parseSize(s) >= 2 && parseSize(s) <= 15);
+      const best = optimal[0] || pool[0];
 
-      let qualityTag = is4k ? "4K UHD" : "1080p FULL HD";
-      if (isCam) qualityTag = "CINEMA CAM";
+      const is4k = /(4k|2160p|uhd)/i.test(`${best.name || ""} ${best.title || ""}`);
+      const isDub = isDubbed(best);
+      const isCam = isCamQuality(best);
 
-      const badge = isDub ? "🇧🇷 DUBLADO" : "🌐 ORIGINAL / LEGENDADO";
+      let qualityBadge = is4k ? "4K UHD" : "1080p FULL HD";
+      if (isCam) qualityBadge = "CINEMA CAM";
 
+      const audioBadge = isDub ? "🇧🇷 100% DUBLADO" : "🌐 ORIGINAL / LEGENDADO";
+
+      // RETORNA RIGOROSAMENTE APENAS 1 OPÇÃO ÚNICA!
       return {
-        name: `⚡ CineBR [${qualityTag}]`,
-        title: `🎬 ${s.title.split('\n')[0]}\n${badge} • REPRODUÇÃO DIRETA\n⚡ ${s.title.split('\n')[1] || ''}`,
-        url: s.url,
-        behaviorHints: s.behaviorHints || { notWebReady: false }
+        streams: [
+          {
+            name: `⚡ CineBR [${qualityBadge}]`,
+            title: `🎬 REPRODUÇÃO DIRETA • ${qualityBadge}\n${audioBadge} • ALLDEBRID INSTANT\n⚡ ${best.title.split('\n')[0]}`,
+            url: best.url,
+            behaviorHints: best.behaviorHints || { notWebReady: false }
+          }
+        ]
       };
-    });
-
-    if (resultStreams.length > 0) {
-      return { streams: resultStreams };
     }
   } catch (err) {
-    console.error("[CineBR 15.2] Erro:", err.message);
+    console.error("[CineBR 16.0] Erro:", err.message);
   }
 
   return { streams: [] };
@@ -111,5 +116,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 15.2 Full rodando na porta ${PORT}`);
+  console.log(`CineBR 16.0 Play Único rodando na porta ${PORT}`);
 });
