@@ -18,44 +18,51 @@ app.use((req, res, next) => {
   next();
 });
 
-// Helper: segue redirecionamentos HTTP (301/302/307) para capturar a URL MP4 direta sem travar no bloqueado
-function resolveFinalTarget(urlStr) {
-  return new Promise((resolve) => {
-    try {
-      const u = new URL(urlStr);
-      const mod = u.protocol === "https:" ? https : http;
-      const req = mod.request(
-        u,
-        {
-          method: "GET",
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            Referer: "https://bestcine.dpdns.org/"
-          }
-        },
-        (res) => {
-          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-            resolve(res.headers.location);
-          } else {
-            resolve(urlStr);
-          }
-        }
-      );
-      req.on("error", () => resolve(urlStr));
-      req.setTimeout(3000, () => {
-        req.destroy();
-        resolve(urlStr);
-      });
-      req.end();
-    } catch (e) {
-      resolve(urlStr);
-    }
-  });
+// Resolve redirect (301/302/307) para capturar o MP4 final
+async function resolveDirectTarget(urlStr) {
+  try {
+    const res = await axios.get(urlStr, {
+      maxRedirects: 0,
+      validateStatus: () => true,
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        Referer: "https://bestcine.dpdns.org/"
+      },
+      timeout: 2500
+    });
+    return res.headers.location || urlStr;
+  } catch (e) {
+    return urlStr;
+  }
 }
 
-// Endpoint local de ponte residencial para o Render:
-// Permite que a nuvem consulte o BestCine através do IP residencial brasileiro sem tomar 403
+// Encontra a melhor stream (1080p ou 4K) do BestCine, resolvendo para o link MP4 final
+async function selectResolvedBestCineStream(rawStreams, is4k) {
+  const candidates = rawStreams.filter((s) => {
+    const qMatch = is4k ? /(4k|2160p|uhd)/i.test(s.name) : /(1080p|fhd)/i.test(s.name);
+    return s.url && qMatch;
+  });
+
+  // Prioriza Servidor Safira e Athena (são os que entregam o vídeo completo imediatamente sem timeout)
+  candidates.sort((a, b) => {
+    const score = (s) => (s.title?.includes("Safira") ? 1 : s.title?.includes("Athena") ? 2 : s.title?.includes("Selene") ? 3 : 4);
+    return score(a) - score(b);
+  });
+
+  for (const cand of candidates) {
+    const directUrl = await resolveDirectTarget(cand.url);
+    if (directUrl && !directUrl.includes("bloqueado") && !directUrl.includes("image2url")) {
+      return {
+        stream: cand,
+        directUrl: directUrl
+      };
+    }
+  }
+  return null;
+}
+
+// Endpoint ponte residencial: o PC local resolve as streams do BestCine e entrega as URLs MP4 já prontas
 app.get("/api/bridge/bestcine/:type/:id", async (req, res) => {
   const { type, id } = req.params;
   try {
@@ -68,20 +75,27 @@ app.get("/api/bridge/bestcine/:type/:id", async (req, res) => {
       },
       timeout: 3500
     });
-    return res.json(bcRes.data || { streams: [] });
+
+    const rawStreams = bcRes.data?.streams || [];
+    if (rawStreams.length === 0) return res.json({ s1080: null, s4k: null });
+
+    const [best1080, best4k] = await Promise.all([
+      selectResolvedBestCineStream(rawStreams, false),
+      selectResolvedBestCineStream(rawStreams, true)
+    ]);
+
+    return res.json({ s1080: best1080, s4k: best4k });
   } catch (err) {
-    return res.json({ streams: [] });
+    return res.json({ s1080: null, s4k: null });
   }
 });
 
-// Função para buscar streams no BestCine:
-// 1) Tenta direto (funciona no PC local)
-// 2) Se estiver no Render e falhar (403), consulta através da ponte do túnel residencial
-async function fetchBestCineStreams(type, id) {
-  // 1. Tenta direto
+// Busca no BestCine direto ou através da ponte residencial
+async function getBestCineResolvedPair(type, id) {
+  // 1. Tenta direto (se o processo estiver rodando em IP residencial ou com acesso)
   try {
     const bcUrl = `https://bestcine.dpdns.org/${BESTCINE_TOKEN}/stream/${type}/${id}.json`;
-    const res = await axios.get(bcUrl, {
+    const bcRes = await axios.get(bcUrl, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -89,43 +103,26 @@ async function fetchBestCineStreams(type, id) {
       },
       timeout: 2500
     });
-    if (res.data?.streams?.length > 0) {
-      return res.data.streams;
+    const rawStreams = bcRes.data?.streams || [];
+    if (rawStreams.length > 0) {
+      const [s1080, s4k] = await Promise.all([
+        selectResolvedBestCineStream(rawStreams, false),
+        selectResolvedBestCineStream(rawStreams, true)
+      ]);
+      if (s1080 || s4k) return { s1080, s4k };
     }
   } catch (e) {}
 
-  // 2. Se falhou (ex: Render bloqueado por IP dos EUA), usa a ponte residencial via túnel
+  // 2. Se falhar (ex: no Render), consulta a ponte residencial via túnel
   try {
     const bridgeUrl = `${TUNNEL_URL}/api/bridge/bestcine/${type}/${id}`;
-    const bridgeRes = await axios.get(bridgeUrl, { timeout: 3500 });
-    if (bridgeRes.data?.streams?.length > 0) {
-      return bridgeRes.data.streams;
+    const bRes = await axios.get(bridgeUrl, { timeout: 4500 });
+    if (bRes.data && (bRes.data.s1080 || bRes.data.s4k)) {
+      return bRes.data;
     }
   } catch (e) {}
 
-  return [];
-}
-
-// Seleciona servidor do BestCine garantindo link válido (Selene, Athena, Solaris, Safira unblocked)
-async function getBestCineStream(streams, is4k) {
-  const candidates = streams.filter((s) => {
-    const qMatch = is4k ? /(4k|2160p|uhd)/i.test(s.name) : /(1080p|fhd)/i.test(s.name);
-    return s.url && qMatch;
-  });
-
-  // Prioriza servidores mais rápidos e estáveis
-  candidates.sort((a, b) => {
-    const p = (s) => (s.title?.includes("Selene") ? 1 : s.title?.includes("Athena") ? 2 : s.title?.includes("Safira") ? 3 : 4);
-    return p(a) - p(b);
-  });
-
-  for (const cand of candidates) {
-    const target = await resolveFinalTarget(cand.url);
-    if (!target.includes("bloqueado")) {
-      return { stream: cand, url: target };
-    }
-  }
-  return null;
+  return { s1080: null, s4k: null };
 }
 
 function parseSize(s) {
@@ -135,7 +132,7 @@ function parseSize(s) {
   return match[2].toUpperCase() === "MB" ? num / 1024 : num;
 }
 
-// Filtro ultra rigoroso para confirmar DUBLAGEM BRASILEIRA autêntica no Torrentio
+// Filtro rigoroso para confirmar DUBLAGEM BRASILEIRA autêntica no Torrentio
 function isRealPtBr(s) {
   const fullText = `${s.name || ""} ${s.title || ""} ${s.behaviorHints?.filename || ""}`.toLowerCase();
 
@@ -172,7 +169,7 @@ function isCamQuality(s) {
 
 const builder = new addonBuilder({
   id: "org.cinebr.nuvio",
-  version: "20.0.0",
+  version: "21.0.0",
   name: "CineBR ⚡ Duas Opções Dubladas (1080p & 4K)",
   description: "Exatamente 2 opções: 1080p Projetor/Celular e 4K Smart TV. Áudio Dublado PT-BR garantido.",
   resources: ["stream"],
@@ -182,7 +179,7 @@ const builder = new addonBuilder({
 });
 
 builder.defineStreamHandler(async ({ type, id }) => {
-  console.log(`[CineBR 20.0] Buscando streams para ${type} ID: ${id}`);
+  console.log(`[CineBR 21.0] Buscando streams para ${type} ID: ${id}`);
   let stream1080 = null;
   let stream4k = null;
 
@@ -190,31 +187,27 @@ builder.defineStreamHandler(async ({ type, id }) => {
   // 1. TENTA PRIMEIRO NO BESTCINE (Fontes 100% Dubladas oficiais MP4 Direto)
   // =========================================================================
   try {
-    const bcStreams = await fetchBestCineStreams(type, id);
-    if (bcStreams.length > 0) {
-      const best1080 = await getBestCineStream(bcStreams, false);
-      const best4k = await getBestCineStream(bcStreams, true);
+    const { s1080, s4k } = await getBestCineResolvedPair(type, id);
 
-      if (best1080) {
-        stream1080 = {
-          name: "⚡ CineBR [1080p DUBLADO]",
-          title: "🎬 1080p FULL HD • 🇧🇷 100% DUBLADO (BRASIL)\n⚡ Otimizado para Projetor e Celular (Zero Travamento)",
-          url: best1080.url,
-          behaviorHints: { notWebReady: false }
-        };
-      }
+    if (s1080 && s1080.directUrl) {
+      stream1080 = {
+        name: "⚡ CineBR [1080p DUBLADO]",
+        title: "🎬 1080p FULL HD • 🇧🇷 100% DUBLADO (BRASIL)\n⚡ Otimizado para Projetor e Celular (Zero Travamento)",
+        url: s1080.directUrl,
+        behaviorHints: { notWebReady: false }
+      };
+    }
 
-      if (best4k) {
-        stream4k = {
-          name: "💎 CineBR [4K DUBLADO]",
-          title: "🎬 4K HDR ULTRA HD • 🇧🇷 100% DUBLADO (BRASIL)\n⚡ Máxima Definição para Smart TV",
-          url: best4k.url,
-          behaviorHints: { notWebReady: false }
-        };
-      }
+    if (s4k && s4k.directUrl) {
+      stream4k = {
+        name: "💎 CineBR [4K DUBLADO]",
+        title: "🎬 4K HDR ULTRA HD • 🇧🇷 100% DUBLADO (BRASIL)\n⚡ Máxima Definição para Smart TV",
+        url: s4k.directUrl,
+        behaviorHints: { notWebReady: false }
+      };
     }
   } catch (err) {
-    console.error("[CineBR 20.0] BestCine check err:", err.message);
+    console.error("[CineBR 21.0] BestCine check err:", err.message);
   }
 
   // =========================================================================
@@ -278,7 +271,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
         }
       }
     } catch (err) {
-      console.error("[CineBR 20.0] AllDebrid error:", err.message);
+      console.error("[CineBR 21.0] AllDebrid error:", err.message);
     }
   }
 
@@ -294,5 +287,5 @@ app.use(getRouter(addonInterface));
 
 const PORT = process.env.PORT || 7000;
 app.listen(PORT, () => {
-  console.log(`CineBR 20.0 Duas Opções Dubladas rodando na porta ${PORT}`);
+  console.log(`CineBR 21.0 Duas Opções Dubladas rodando na porta ${PORT}`);
 });
